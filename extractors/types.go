@@ -1,5 +1,7 @@
 package extractors
 
+import "github.com/iawia002/lux/subtitle"
+
 // Part is the data structure for a single part of the video stream information.
 type Part struct {
 	URL  string `json:"url"`
@@ -9,7 +11,7 @@ type Part struct {
 
 type CaptionPart struct {
 	Part
-	Transform func([]byte) ([]byte, error) `json:"-"`
+	Transform subtitle.TransformFunc `json:"-"`
 }
 
 // Stream is the data structure for each video stream, eg: 720P, 1080P.

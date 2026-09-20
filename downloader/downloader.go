@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +20,7 @@ import (
 
 	"github.com/iawia002/lux/extractors"
 	"github.com/iawia002/lux/request"
+	"github.com/iawia002/lux/subtitle"
 	"github.com/iawia002/lux/utils"
 )
 
@@ -74,38 +74,48 @@ func New(option Options) *Downloader {
 	return downloader
 }
 
-// caption downloads danmaku, subtitles, etc
-func (downloader *Downloader) caption(url, fileName, ext string, transform func([]byte) ([]byte, error)) error {
-	refer := downloader.option.Refer
-	if refer == "" {
-		refer = url
-	}
-	body, err := request.GetByte(url, refer, nil)
-	if err != nil {
-		return err
-	}
-
-	if transform != nil {
-		body, err = transform(body)
-		if err != nil {
-			return err
+// captions returns a subtitle processor for the given title, downloading
+// and converting all captions of the data.
+func (downloader *Downloader) captions(data *extractors.Data, title string) *subtitle.Processor {
+	processor := subtitle.New(subtitle.Options{
+		Embed: downloader.option.EmbedSubtitle,
+		Fetch: func(url string) ([]byte, error) {
+			refer := downloader.option.Refer
+			if refer == "" {
+				refer = url
+			}
+			return request.GetByte(url, refer, nil)
+		},
+		FilePath: func(ext string) (string, error) {
+			return utils.FilePath(title, ext, downloader.option.FileNameLength, downloader.option.OutputPath, true)
+		},
+	})
+	fmt.Println("\nDownloading captions...")
+	for lang, part := range data.Captions {
+		if part == nil {
+			continue
 		}
+		fmt.Printf("Downloading %s ...\n", lang)
+		// nolint
+		_ = processor.Add(lang, subtitle.Source{
+			URL:       part.URL,
+			Ext:       part.Ext,
+			Transform: part.Transform,
+		})
 	}
+	return processor
+}
 
-	filePath, err := utils.FilePath(fileName, ext, downloader.option.FileNameLength, downloader.option.OutputPath, true)
-	if err != nil {
-		return err
+// embedCaptions embeds the downloaded captions into the video and cleans
+// up the temporary subtitle files.
+func (downloader *Downloader) embedCaptions(captions *subtitle.Processor, videoPath string) error {
+	if captions == nil || !downloader.option.EmbedSubtitle || len(captions.Tracks()) == 0 {
+		return nil
 	}
-	file, fileError := os.Create(filePath)
-	if fileError != nil {
-		return fileError
+	if !downloader.option.Silent {
+		fmt.Println("Embedding subtitles...")
 	}
-	defer file.Close() // nolint
-
-	if _, err = file.Write(body); err != nil {
-		return err
-	}
-	return nil
+	return captions.Embed(videoPath)
 }
 
 func (downloader *Downloader) writeFile(url string, file *os.File, headers map[string]string) (int64, error) {
@@ -606,31 +616,10 @@ func (downloader *Downloader) Download(data *extractors.Data) error {
 		printStreamInfo(data, stream)
 	}
 
-	// download caption
-	var subtitlePaths []string
-	var subtitleLangs []string
-	var subtitleFilesToDelete []string
+	// download captions
+	var captions *subtitle.Processor
 	if downloader.option.Caption && data.Captions != nil {
-		fmt.Println("\nDownloading captions...")
-		for k, v := range data.Captions {
-			if v != nil {
-				fmt.Printf("Downloading %s ...\n", k)
-				if err := downloader.caption(v.URL, title, v.Ext, v.Transform); err != nil {
-					// nolint
-				} else if downloader.option.EmbedSubtitle {
-					subtitlePath, _ := utils.FilePath(title, v.Ext, downloader.option.FileNameLength, downloader.option.OutputPath, true)
-					subtitleFilesToDelete = append(subtitleFilesToDelete, subtitlePath)
-					if strings.HasSuffix(v.Ext, "xml") {
-						if srtPath, err := utils.ConvertXMLFileToSRT(subtitlePath); err == nil {
-							subtitlePath = srtPath
-							subtitleFilesToDelete = append(subtitleFilesToDelete, srtPath)
-						}
-					}
-					subtitlePaths = append(subtitlePaths, subtitlePath)
-					subtitleLangs = append(subtitleLangs, k)
-				}
-			}
-		}
+		captions = downloader.captions(data, title)
 	}
 
 	// Use aria2 rpc to download
@@ -671,16 +660,8 @@ func (downloader *Downloader) Download(data *extractors.Data) error {
 		}
 		downloader.Bar.Finish()
 
-		if downloader.option.EmbedSubtitle && len(subtitlePaths) > 0 {
-			if !downloader.option.Silent {
-				fmt.Println("Embedding subtitles...")
-			}
-			if err := utils.EmbedSubtitles(mergedFilePath, subtitlePaths, subtitleLangs); err != nil {
-				return err
-			}
-			for _, path := range subtitleFilesToDelete {
-				os.Remove(path)
-			}
+		if err := downloader.embedCaptions(captions, mergedFilePath); err != nil {
+			return err
 		}
 		return nil
 	}
@@ -745,16 +726,8 @@ func (downloader *Downloader) Download(data *extractors.Data) error {
 		}
 	}
 
-	if downloader.option.EmbedSubtitle && len(subtitlePaths) > 0 {
-		if !downloader.option.Silent {
-			fmt.Println("Embedding subtitles...")
-		}
-		if err := utils.EmbedSubtitles(mergedFilePath, subtitlePaths, subtitleLangs); err != nil {
-			return err
-		}
-		for _, path := range subtitleFilesToDelete {
-			os.Remove(path)
-		}
+	if err := downloader.embedCaptions(captions, mergedFilePath); err != nil {
+		return err
 	}
 
 	return nil
